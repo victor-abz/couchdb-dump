@@ -1,4 +1,6 @@
 #!/bin/bash
+
+
 ##
 #    AUTHOR: DANIELE BAILO
 #    https://github.com/danielebailo
@@ -24,12 +26,18 @@
 ###################### CODE STARTS HERE ###################
 scriptversionnumber="1.1.10"
 
+# Path to relevant split command. On macos you should use perlpowertools split command to avoid compatibility issues with gnu-split.
+split_command_path="split"
+
 ##START: FUNCTIONS
 usage(){
     echo
-    echo "Usage: $0 [-b|-r] -H <COUCHDB_HOST> -d <DB_NAME> -f <BACKUP_FILE> [-u <username>] [-p <password>] [-P <port>] [-l <lines>] [-t <threads>] [-a <import_attempts>]"
+    echo "Usage: $0 [-b|-r|-i] -H <COUCHDB_HOST> -d <DB_NAME> -f <BACKUP_FILE> [-u <username>] [-p <password>] [-P <port>] [-l <lines>] [-t <threads>] [-a <import_attempts>] [-s <start_at_filename>]"
     echo -e "\t-b   Run script in BACKUP mode."
     echo -e "\t-r   Run script in RESTORE mode."
+    echo -e "\t-i   Run script in IMPORT-ONLY mode (import pre-split files, skip splitting/design docs)."
+    echo -e "\t-n   No-transform mode: skip all file transformations (use with -i for pre-processed files)."
+    echo -e "\t-D   Delay in seconds between imports (use with -i to prevent CouchDB overload)."
     echo -e "\t-H   CouchDB Hostname or IP. Can be provided with or without 'http(s)://'"
     echo -e "\t-d   CouchDB Database name to backup/restore."
     echo -e "\t-f   File to Backup-to/Restore-from."
@@ -40,7 +48,8 @@ usage(){
     echo -e "\t       -- can also set with 'COUCHDB_PASS' environment var"
     echo -e "\t-l   Number of lines (documents) to Restore at a time. [Default: 5000] (Restore Only)"
     echo -e "\t-t   Number of CPU threads to use when parsing data [Default: nProcs-1] (Backup Only)"
-    echo -e "\t-a   Number of times to Attempt import before failing [Default: 3] (Restore Only)"
+    echo -e "\t-a   Number of times to Attempt import before failing [Default: 3] (Restore/Import-Only)"
+    echo -e "\t-s   Start at this specific split filename (Restore/Import-Only)"
     echo -e "\t-c   Create DB on demand, if they are not listed."
     echo -e "\t-q   Run in quiet mode. Suppress output, except for errors and warnings."
     echo -e "\t-z   Compress output file (Backup Only)"
@@ -106,6 +115,9 @@ username=""
 password=""
 backup=false
 restore=false
+import_only=false
+no_transform=false
+import_delay=0
 port=5984
 OPTIND=1
 lines=5000
@@ -114,12 +126,16 @@ createDBsOnDemand=false
 verboseMode=true
 compress=false
 timestamp=false
+start_at_file=""
 
-while getopts ":h?H:d:f:u:p:P:l:t:a:c?q?z?T?V?b?B?r?R?" opt; do
+while getopts ":h?H:d:f:u:p:P:l:t:s:a:D:c?q?z?T?V?b?B?r?R?i?I?n?N?" opt; do
     case "$opt" in
         h) usage;;
         b|B) backup=true ;;
         r|R) restore=true ;;
+        i|I) import_only=true ;;
+        n|N) no_transform=true ;;
+        D) import_delay="${OPTARG}" ;;
         H) url="$OPTARG" ;;
         d) db_name="$OPTARG" ;;
         f) file_name="$OPTARG" ;;
@@ -129,6 +145,7 @@ while getopts ":h?H:d:f:u:p:P:l:t:a:c?q?z?T?V?b?B?r?R?" opt; do
         l) lines="${OPTARG}" ;;
         t) threads="${OPTARG}" ;;
         a) attempts="${OPTARG}";;
+        s) start_at_file="${OPTARG}";;
         c) createDBsOnDemand=true;;
         q) verboseMode=false;;
         z) compress=true;;
@@ -156,12 +173,17 @@ if [ ! "x$@" = "x" ]; then
     usage
 fi
 
-# Handle invalid backup/restore states:
-if [ $backup = true ]&&[ $restore = true ]; then
-    echo "... ERROR: Cannot pass both '-b' and '-r'"
+# Handle invalid backup/restore/import_only states:
+mode_count=0
+[ $backup = true ] && (( mode_count++ ))
+[ $restore = true ] && (( mode_count++ ))
+[ $import_only = true ] && (( mode_count++ ))
+
+if [ $mode_count -gt 1 ]; then
+    echo "... ERROR: Cannot pass multiple mode flags (-b, -r, -i). Choose one."
     usage
-elif [ $backup = false ]&&[ $restore = false ]; then
-    echo "... ERROR: Missing argument '-b' (Backup), or '-r' (Restore)"
+elif [ $mode_count -eq 0 ]; then
+    echo "... ERROR: Missing argument '-b' (Backup), '-r' (Restore), or '-i' (Import-Only)"
     usage
 fi
 # Handle empty args
@@ -335,10 +357,10 @@ if [ $backup = true ]&&[ $restore = false ]; then
         exit 1
     fi
 
-    # CouchDB has a tendancy to output Windows carriage returns in it's output -
+    # CouchDB has a tendancy to output Windows carridge returns in it's output -
     # This messes up us trying to sed things at the end of lines!
     if grep -qU $'\x0d' $file_name; then
-        $echoVerbose && echo "... INFO: File may contain Windows carriage returns- converting..."
+        $echoVerbose && echo "... INFO: File may contain Windows carridge returns- converting..."
         filesize=$(du -P -k ${file_name} | awk '{print$1}')
         checkdiskspace "${file_name}" $filesize
         tr -d '\r' < ${file_name} > ${file_name}.tmp
@@ -599,7 +621,7 @@ elif [ $restore = true ]&&[ $backup = false ]; then
             echo "${line}" | $sed_cmd -${sed_regexp_option}e "s@^\{\"_id\":\"${URLPATH}\",\"_rev\":\"[0-9]*-[0-9a-zA-Z_\-]*\",@\{@" | $sed_cmd -e 's/,$//' > ${design_file_name}.${designcount}
             # Fix Windows CRLF
             if grep -qU $'\x0d' ${design_file_name}.${designcount}; then
-                $echoVerbose && echo "... INFO: File contains Windows carriage returns- converting..."
+                $echoVerbose && echo "... INFO: File contains Windows carridge returns- converting..."
                 filesize=$(du -P -k ${design_file_name}.${designcount} | awk '{print$1}')
                 checkdiskspace "${file_name}" $filesize
                 tr -d '\r' < ${design_file_name}.${designcount} > ${design_file_name}.${designcount}.tmp
@@ -707,7 +729,10 @@ elif [ $restore = true ]&&[ $backup = false ]; then
         filesize=$(du -P -k ${file_name} | awk '{print$1}')
         checkdiskspace "${file_name}" $filesize
         ### Split the file into many
-        split -a 3 -l ${lines} ${file_name} ${file_name}.split
+        
+        ${split_command_path} -l ${lines} ${file_name} ${file_name}.split
+        # using perl split above instead of this, which sometimes breaks lines across files
+        # split -a 3 -l ${lines} ${file_name} ${file_name}.split
         if [ ! "$?" = "0" ]; then
             echo "... ERROR: Unable to create split files."
             exit 1
@@ -715,12 +740,34 @@ elif [ $restore = true ]&&[ $backup = false ]; then
         HEADER="`head -n 1 $file_name`"
         FOOTER="`tail -n 1 $file_name`"
 
+		actually_do_it=true
+		
+		if [ ! -z "$start_at_filename" ] ; then
+			actually_do_it=false
+		fi
+		
         count=0
         for PADNUM in $AZ3; do
             PADNAME="${file_name}.split${PADNUM}"
             if [ ! -f ${PADNAME} ]; then
-                echo "... INFO: Import Cycle Completed."
-                break
+            	if ! $actually_do_it ; then
+            	  echo "Looking for start file: $start_at_filename, scrolling past $PADNAME"
+            	else
+                  echo "... INFO: Import Cycle Completed."
+                  break
+                fi
+            fi
+            
+            if [ ! -z "$start_at_filename" ] && [ $PADNAME = $start_at_filename ] ; then 
+            	echo "Reached start file ${start_at_filename}"
+            	actually_do_it=true;
+            fi
+            
+            if $actually_do_it ; then
+                echo "good to go now"
+            else
+                echo "Skipping ${PADNAME} because we are not yet at start file ${start_at_filename}"
+            	continue
             fi
 
             if [ ! "`head -n 1 ${PADNAME}`" = "${HEADER}" ]; then
@@ -777,4 +824,277 @@ elif [ $restore = true ]&&[ $backup = false ]; then
             rm -f ${file_name_orig}-nodesign
         done
     fi
+
+### Else if user selected Import-Only mode:
+elif [ $import_only = true ]; then
+    #################################################################
+    ##################### IMPORT-ONLY START ##########################
+    #################################################################
+    # This mode imports pre-existing split files without splitting or design doc handling.
+    # Useful for distributing pre-split files to others for import.
+
+    $echoVerbose && echo "... INFO: Running in IMPORT-ONLY mode"
+
+    # Check for directory structure or flat files
+    if ls -d "${file_name}.split_dir"* >/dev/null 2>&1; then
+        $echoVerbose && echo "... INFO: Found directory structure: ${file_name}.split_dir*"
+    elif [ -f "${file_name}.splitaaa" ]; then
+        $echoVerbose && echo "... INFO: Found flat files: ${file_name}.split*"
+    else
+        echo "... ERROR: No split files found."
+        echo "... ERROR: Expected directories like ${file_name}.split_dir0000/ or files like ${file_name}.splitaaa"
+        exit 1
+    fi
+
+    $echoVerbose && echo "... INFO: Checking for database"
+    attemptcount=0
+    A=0
+    until [ $A = 1 ]; do
+        (( attemptcount++ ))
+        existing_dbs=$(curl $curlSilentOpt $curlopt -X GET "${url}/_all_dbs")
+        if [ ! $? = 0 ]; then
+            if [ $attemptcount = $attempts ]; then
+                echo "... ERROR: Curl failed to get the list of databases - Stopping"
+                exit 1
+            else
+                echo "... WARN: Curl failed to get the list of databases - Attempt ${attemptcount}/${attempts}. Retrying..."
+                sleep 1
+            fi
+        else
+            A=1
+        fi
+    done
+    if [[ ! "$existing_dbs" = "["*"]" ]]; then
+        echo "... WARN: Curl failed to get the list of databases - Continuing"
+        if [ "x$existing_dbs" = "x" ]; then
+            echo "... WARN: Curl just returned: $existing_dbs"
+        fi
+    elif [[ ! "$existing_dbs" = *"\"${db_name}\""* ]]; then
+        if [ $createDBsOnDemand = true ]; then
+            attemptcount=0
+            A=0
+            until [ $A = 1 ]; do
+                (( attemptcount++ ))
+                curl $curlSilentOpt $curlopt -X PUT "${url}/${db_name}" -o tmp.out
+                if [ ! $? = 0 ]; then
+                    if [ $attemptcount = $attempts ]; then
+                        echo "... ERROR: Curl failed to create the database ${db_name} - Stopping"
+                        if [ -f tmp.out ]; then
+                            echo -n "... ERROR: Error message was:   "
+                            cat tmp.out
+                        else
+                            echo ".. ERROR: See above for any errors"
+                        fi
+                        exit 1
+                    else
+                        echo "... WARN: Curl failed to create the database ${db_name} - Attempt ${attemptcount}/${attempts}. Retrying..."
+                        sleep 1
+                    fi
+                elif [ ! "`head -n 1 tmp.out | grep -c '^{"error":'`" = 0 ]; then
+                    if [ $attemptcount = $attempts ]; then
+                        echo "... ERROR: CouchDB Reported: `head -n 1 tmp.out`"
+                        exit 1
+                    else
+                        echo "... WARN: CouchDB Reported an error during db creation - Attempt ${attemptcount}/${attempts} - Retrying..."
+                        sleep 1
+                    fi
+                else
+                    rm tmp.out
+                    A=1
+                fi
+            done
+        else
+            echo "... ERROR: corresponding database ${db_name} not yet created - Stopping"
+            $echoVerbose && echo "... HINT: you could add the -c flag to create the database automatically"
+            exit 1
+        fi
+    fi
+
+    # Handle -s (start_at_file) option
+    actually_do_it=true
+    if [ ! -z "$start_at_file" ]; then
+        actually_do_it=false
+    fi
+
+    # Standard header/footer for CouchDB bulk import
+    HEADER='{"new_edits":false,"docs":['
+    FOOTER=']}'
+
+    count=0
+    
+    # Build list of files to import
+    # Check if using directory structure (new) or flat files (old)
+    if ls -d "${file_name}.split_dir"* >/dev/null 2>&1; then
+        # New directory structure: base.split_dir0000/, base.split_dir0001/, etc.
+        $echoVerbose && echo "... INFO: Using directory structure"
+        FILE_LIST=$(find "${file_name}.split_dir"* -name 'split*' -type f 2>/dev/null | sort)
+    else
+        # Old flat file structure: base.splitaaa, base.splitaab, etc.
+        $echoVerbose && echo "... INFO: Using flat file structure"
+        FILE_LIST=""
+        for PADNUM in $AZ3; do
+            PADNAME="${file_name}.split${PADNUM}"
+            if [ -f "${PADNAME}" ]; then
+                FILE_LIST="${FILE_LIST} ${PADNAME}"
+            fi
+        done
+    fi
+    
+    # Count total files for progress
+    TOTAL_FILES=$(echo "$FILE_LIST" | wc -w | tr -d ' ')
+    $echoVerbose && echo "... INFO: Found ${TOTAL_FILES} files to import"
+    
+    for PADNAME in $FILE_LIST; do
+        if [ ! -f "${PADNAME}" ]; then
+            continue
+        fi
+        
+        # Handle start_at_file (-s flag)
+        if [ ! -z "$start_at_file" ] && [ "$PADNAME" = "$start_at_file" ]; then
+            echo "... INFO: Reached start file ${start_at_file}"
+            actually_do_it=true
+        fi
+        
+        if ! $actually_do_it; then
+            continue
+        fi
+
+        # Skip all transformations if -n flag is set
+        if [ "$no_transform" = false ]; then
+            # First, strip Windows carriage returns if present
+            if grep -qU $'\x0d' ${PADNAME} 2>/dev/null; then
+                $echoVerbose && echo "... INFO: Removing Windows carriage returns from ${PADNAME}"
+                filesize=$(du -P -k ${PADNAME} | awk '{print$1}')
+                checkdiskspace "${PADNAME}" $filesize
+                tr -d '\r' < ${PADNAME} > ${PADNAME}.tmp && mv ${PADNAME}.tmp ${PADNAME}
+            fi
+            
+            # Check if file needs transformation (raw CouchDB format vs processed)
+            needs_transform=false
+            needs_brace_fix=false
+            
+            # Detect raw format by checking for "doc":{ pattern (indicates wrapper needs stripping)
+            if grep -q '"doc":{' ${PADNAME} 2>/dev/null; then
+                needs_transform=true
+            fi
+            
+            # Also check for }}, at end of line (indicates Stage 2 brace fix is needed for raw format)
+            # Only trigger on lines that END with }}, which indicates raw wrapper, not valid nested JSON
+            if grep -q '^{.*}},\s*$' ${PADNAME} 2>/dev/null; then
+                needs_brace_fix=true
+            fi
+            
+            if [ "$needs_transform" = true ]; then
+                $echoVerbose && echo "... INFO: Transforming raw format in ${PADNAME}"
+                filesize=$(du -P -k ${PADNAME} | awk '{print$1}')
+                checkdiskspace "${PADNAME}" $filesize
+                
+                # Remove raw header line if present ({"total_rows":... or leftover from previous run)
+                if grep -q '^{"total_rows":' ${PADNAME} 2>/dev/null; then
+                    $echoVerbose && echo "... INFO:   Removing raw header line"
+                    $sed_cmd ${sed_edit_in_place} '/^{"total_rows":/d' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                fi
+                
+                # Stage 1: Strip {"id":...,"doc": wrapper from each document
+                $echoVerbose && echo "... INFO:   Stage 1 - Stripping document wrapper"
+                $sed_cmd ${sed_edit_in_place} 's/{"id".*,"doc"://g' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                
+                # Stage 2: Fix double closing braces }}, -> },
+                $echoVerbose && echo "... INFO:   Stage 2 - Fixing double braces"
+                $sed_cmd ${sed_edit_in_place} 's/}},$/},/g' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                
+                # Stage 4: Fix end brace on last document }} -> }
+                $echoVerbose && echo "... INFO:   Stage 4 - Fixing end braces"
+                $sed_cmd ${sed_edit_in_place} 's/}}$/}/g' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                
+            elif [ "$needs_brace_fix" = true ]; then
+                # Partial transformation - wrapper stripped but braces not fixed
+                $echoVerbose && echo "... INFO: Fixing braces in ${PADNAME}"
+                filesize=$(du -P -k ${PADNAME} | awk '{print$1}')
+                checkdiskspace "${PADNAME}" $filesize
+                
+                # Stage 2: Fix double closing braces }}, -> },
+                $echoVerbose && echo "... INFO:   Stage 2 - Fixing double braces"
+                $sed_cmd ${sed_edit_in_place} 's/}},$/},/g' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                
+                # Stage 4: Fix end brace on last document }} -> }
+                $echoVerbose && echo "... INFO:   Stage 4 - Fixing end braces"
+                $sed_cmd ${sed_edit_in_place} 's/}}$/}/g' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+            fi
+            
+            # Fix header if needed
+            first_line=$(head -n 1 ${PADNAME})
+            if [ ! "$first_line" = "${HEADER}" ]; then
+                $echoVerbose && echo "... INFO: Adding header to ${PADNAME}"
+                filesize=$(du -P -k ${PADNAME} | awk '{print$1}')
+                checkdiskspace "${PADNAME}" $filesize
+                # Insert header at beginning (don't replace - first line might be a document)
+                $sed_cmd ${sed_edit_in_place} "1i${HEADER}" ${PADNAME} && rm -f ${PADNAME}.sedtmp
+            fi
+            
+            # Fix footer if needed
+            last_line=$(tail -n 1 ${PADNAME})
+            if [ "$last_line" = "${FOOTER}" ]; then
+                # Footer exists, but check if second-to-last line has trailing comma
+                second_to_last=$(tail -n 2 ${PADNAME} | head -n 1)
+                if [[ "$second_to_last" == *, ]]; then
+                    $echoVerbose && echo "... INFO: Removing trailing comma before footer in ${PADNAME}"
+                    filesize=$(du -P -k ${PADNAME} | awk '{print$1}')
+                    checkdiskspace "${PADNAME}" $filesize
+                    # Remove the trailing comma from second-to-last line
+                    total_lines=$(wc -l < ${PADNAME})
+                    target_line=$((total_lines - 1))
+                    $sed_cmd ${sed_edit_in_place} "${target_line}s/,$//" ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                fi
+            else
+                $echoVerbose && echo "... INFO: Fixing footer in ${PADNAME}"
+                filesize=$(du -P -k ${PADNAME} | awk '{print$1}')
+                checkdiskspace "${PADNAME}" $filesize
+                # Remove trailing comma from last line, then add footer
+                $sed_cmd ${sed_edit_in_place} '$s/,$//' ${PADNAME} && rm -f ${PADNAME}.sedtmp
+                echo "${FOOTER}" >> ${PADNAME}
+            fi
+        fi
+
+        $echoVerbose && echo "... INFO: Importing ${PADNAME}"
+        A=0
+        attemptcount=0
+        until [ $A = 1 ]; do
+            (( attemptcount++ ))
+            curl $curlSilentOpt $curlopt -T ${PADNAME} -X POST "$url/$db_name/_bulk_docs" -H 'Content-Type: application/json' -o tmp.out
+            if [ ! $? = 0 ]; then
+                if [ $attemptcount = $attempts ]; then
+                    echo "... ERROR: Curl failed trying to import ${PADNAME} - Stopping"
+                    echo "... INFO: Resume with: -i -s ${PADNAME}"
+                    exit 1
+                else
+                    echo "... WARN: Failed to import ${PADNAME} - Attempt ${attemptcount}/${attempts} - Retrying..."
+                    sleep 1
+                fi
+            elif [ ! "`head -n 1 tmp.out | grep -c '^{"error":'`" = 0 ]; then
+                if [ $attemptcount = $attempts ]; then
+                    echo "... ERROR: CouchDB Reported: `head -n 1 tmp.out`"
+                    echo "... INFO: Resume with: -i -s ${PADNAME}"
+                    exit 1
+                else
+                    echo "... WARN: CouchDB Reported an error during import - Attempt ${attemptcount}/${attempts} - Retrying..."
+                    sleep 1
+                fi
+            else
+                A=1
+                rm -f tmp.out
+                (( count++ ))
+            fi
+        done
+        $echoVerbose && echo "... INFO: Successfully imported ${PADNAME} (${count}/${TOTAL_FILES})"
+        
+        # Delay between imports if specified
+        if [ "$import_delay" -gt 0 ] 2>/dev/null; then
+            $echoVerbose && echo "... INFO: Waiting ${import_delay} seconds before next import..."
+            sleep ${import_delay}
+        fi
+    done
+
+    $echoVerbose && echo "... INFO: Import-only completed. Total files imported: ${count}"
+    exit 0
 fi
